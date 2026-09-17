@@ -1,10 +1,10 @@
 import os
-import uuid
-import base64
+import io
+import time
+import requests
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory
-from PIL import Image, ImageEnhance, ImageFilter
-import requests
+from PIL import Image
 
 app = Flask(__name__)
 
@@ -13,41 +13,24 @@ UPLOAD_FOLDER.mkdir(exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
-# Free fast text-to-image / diffusion model on Hugging Face
-HF_API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+# Stable Diffusion model on Hugging Face
+HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 
-def apply_local_retro_filter(image: Image.Image, era: str) -> Image.Image:
-    img = image.convert("RGB")
-    r, g, b = img.split()
-    if era == "1970s":
-        r = r.point(lambda i: min(255, int(i * 1.15)))
-        b = b.point(lambda i: int(i * 0.85))
-    elif era == "1990s":
-        b = b.point(lambda i: min(255, int(i * 1.15)))
-    else:  # 1980s
-        r = r.point(lambda i: min(255, int(i * 1.20)))
-        g = g.point(lambda i: int(i * 1.05))
-        b = b.point(lambda i: int(i * 0.90))
-    img = Image.merge("RGB", (r, g, b))
-    img = ImageEnhance.Color(img).enhance(1.3)
-    img = ImageEnhance.Contrast(img).enhance(1.2)
-    return img
-
-def generate_with_huggingface(prompt: str):
-    if not HF_TOKEN:
-        return None
+def generate_huggingface_image(prompt: str) -> Image.Image:
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {"num_inference_steps": 4}
-    }
-    try:
-        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=40)
+    payload = {"inputs": prompt}
+    
+    # Retry logic if model is loading
+    for _ in range(5):
+        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
-            return Image.open(requests.compat.BytesIO(response.content))
-    except Exception as e:
-        print(f"HF Error: {e}")
-    return None
+            return Image.open(io.BytesIO(response.content))
+        elif "estimated_time" in response.text:
+            time.sleep(10)
+        else:
+            break
+            
+    raise Exception(f"HF API Error ({response.status_code}): {response.text}")
 
 @app.route("/")
 def index():
@@ -57,55 +40,46 @@ def index():
 def serve_output(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
-def process_image():
-    file = request.files.get("image") or request.files.get("photo")
-    if not file or file.filename == "":
-        return jsonify({"error": "No image uploaded"}), 400
+@app.route("/convert", methods=["POST"])
+def convert():
+    if "photo" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
 
     era = request.form.get("era", "1980s")
     custom_prompt = request.form.get("prompt", "")
 
-    # 1985 Retro Styling Prompt
-    base_prompt = (
-        f"A real vintage authentic {era} photograph, 1985 fashion style, retro clothing, "
-        f"voluminous retro hairstyle, analog film grain, polaroid warm color palette, direct camera flash."
-    )
+    # Retro era prompts
+    era_styles = {
+        "1970s": "vintage 1970s Polaroid photo, warm muted colors, film grain, retro clothing and hairstyle, authentic 70s aesthetics",
+        "1980s": "1980s vintage photo, retro synthwave mood, VHS grain, neon warm lighting, authentic 80s aesthetics",
+        "1990s": "1990s disposable camera 35mm photograph, flash portrait, grunge retro aesthetics, 90s vibes"
+    }
+
+    style = era_styles.get(era, era_styles["1980s"])
+    full_prompt = f"Portrait of a person, {style}."
     if custom_prompt:
-        full_prompt = f"{base_prompt}, {custom_prompt}"
-    else:
-        full_prompt = base_prompt
+        full_prompt += f" Details: {custom_prompt}"
 
-    output_name = f"retro_{era.lower()}_{uuid.uuid4().hex[:8]}.jpg"
-    output_path = app.config["UPLOAD_FOLDER"] / output_name
+    try:
+        if HF_TOKEN:
+            result_img = generate_huggingface_image(full_prompt)
+            output_name = f"retro_{int(time.time())}.jpg"
+            output_path = app.config["UPLOAD_FOLDER"] / output_name
+            result_img.save(output_path, format="JPEG")
 
-    # Try Hugging Face Free AI generation first
-    generated_img = generate_with_huggingface(full_prompt)
+            return jsonify({
+                "imageUrl": f"/outputs/{output_name}",
+                "downloadUrl": f"/outputs/{output_name}",
+                "prompt": full_prompt
+            })
+        else:
+            return jsonify({"error": "HF_TOKEN not configured"}), 400
 
-    if generated_img:
-        generated_img.save(output_path, format="JPEG", quality=92)
-        status_note = f"Generated using Hugging Face AI ({era} vintage style)."
-    else:
-        # Fallback to local filter if API is loading or token missing
-        raw_img = Image.open(file.stream)
-        converted = apply_local_retro_filter(raw_img, era)
-        converted.save(output_path, format="JPEG", quality=90)
-        status_note = f"Applied {era} retro analog filter."
-
-    return jsonify({
-        "imageUrl": f"/outputs/{output_name}",
-        "downloadUrl": f"/outputs/{output_name}",
-        "prompt": f"{full_prompt} ({status_note})"
-    })
-
-@app.route("/api/convert", methods=["POST"])
-def api_convert():
-    return process_image()
-
-@app.route("/convert", methods=["POST"])
-def normal_convert():
-    return process_image()
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    
     
