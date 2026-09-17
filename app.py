@@ -13,7 +13,7 @@ UPLOAD_FOLDER.mkdir(exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
-# Fast and lightweight model to prevent timeout
+# Lightweight aur fast model: Stable Diffusion v1.5
 HF_API_URL = "https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5"
 
 def generate_huggingface_image(prompt: str) -> Image.Image:
@@ -75,3 +75,4 @@ def convert():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    
